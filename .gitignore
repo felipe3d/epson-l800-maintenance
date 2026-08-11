@@ -1,0 +1,24 @@
+# Virtual environments
+venv/
+reinkpy-venv/
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Generated files
+epson_config.pickle
+epson.toml
+
+# OS files
+.DS_Store
+Thumbs.db
+epson_print_conf/
