@@ -1,129 +1,109 @@
 #!/usr/bin/env python3
 """
-Epson L800 — Limpeza de cabeça via USB + D4.
-Usa o mesmo padrão que o reset: EpsonD4 + ctrl() / data channel.
+Epson L800 — Limpeza de cabeça via USB raw (modo escputil).
+Envia bytes ESC/P2 Remote Mode diretamente ao endpoint USB,
+sem usar D4. Igual ao que o escputil (GIMP-Print) faz.
 
-Uso: sudo .../python clean_heads.py <opção>
-  1=Normal  2=Preto  3=Cores  4=PowerClean  5=TesteBicos
+Uso: sudo .../python clean_heads.py [1|5]
+  1 = Limpeza Normal
+  5 = Teste de Bicos
 """
-import sys, logging, datetime
+import sys, logging
 logging.basicConfig(level=logging.INFO)
 
 import usb.backend.libusb1 as _backend
 b = _backend.get_backend()
 import usb.core, usb.util
-from reinkpy.usb import UsbIO
-from reinkpy.d4 import D4Link
-from reinkpy.epson import EpsonD4
+
+def build_remote_cmd(cmd_ascii, *args):
+    """
+    Monta sequência Remote Mode no formato do escputil.c:
+    
+    ESC @ ESC @       → 2x initialize printer
+    ESC (R 08 00 00 00 REMOTE1   → enter remote mode
+    CC nn ll pp...    → comando (2B) + byte count (2B LE) + parametros
+    ESC 00 00 00      → exit remote mode
+    """
+    cmd = cmd_ascii.encode()
+    nargs = len(args)
+    remote_hdr = b'\x1b@\x1b@\x1b(R\x08\x00\x00\x00REMOTE1'
+    remote_tlr = b'\x1b\x00\x00\x00'
+    return remote_hdr + cmd + nargs.to_bytes(2, 'little') + bytes(args) + remote_tlr
+
+def build_full_sequence(cmd, *args):
+    """
+    Sequência completa que o escputil manda:
+    
+    00 00 00 1B 01 @EJL 1284.4 \n @EJL     \n   → exit packet mode
+    1B @                                              → init printer
+    <remote_cmd>
+    0C                                                → form feed
+    1B 00 1B 00                                       → resets
+    """
+    EXIT_PACKET = b'\x00\x00\x00\x1b\x01@EJL 1284.4\n@EJL     \n\x1b@'
+    PRINT_TAIL  = b'\x0c\x1b\x00\x1b\x00'
+    return EXIT_PACKET + build_remote_cmd(cmd, *args) + PRINT_TAIL
 
 def main():
     if len(sys.argv) < 2:
-        print("Uso: sudo .../python clean_heads.py [1-5]"); sys.exit(1)
+        print("Uso: sudo .../python clean_heads.py [1|5]"); sys.exit(1)
     choice = sys.argv[1]
-
-    groups = {
-        "1": (0x00, "Limpeza Normal (todos bicos)"),
-        "2": (0x01, "Limpeza Preto"),
-        "3": (0x02, "Limpeza Cores"),
-        "4": (0x10, "Power Cleaning"),
-        "5": (None, "Teste de Bicos"),
+    
+    actions = {
+        "1": (build_full_sequence("CH", 0, 0), "Limpeza Normal (todos bicos)"),
+        "5": (build_full_sequence("NC", 0, 0), "Teste de Bicos"),
     }
-    if choice not in groups:
-        print("Inválido. Use 1-5"); sys.exit(1)
-
-    group, label = groups[choice]
-
-    # Conectar USB
+    if choice not in actions:
+        print("Use 1 ou 5."); sys.exit(1)
+    
+    payload, label = actions[choice]
+    
+    # Conectar USB direto (sem reinkpy, sem D4)
     dev = usb.core.find(idVendor=0x04b8, backend=b)
     if not dev:
         print("❌ L800 não encontrada!"); sys.exit(1)
+    
     print(f"✅ L800 (Bus={dev.bus} Addr={dev.address})")
-
-    if dev.is_kernel_driver_active(0):
-        dev.detach_kernel_driver(0)
-
+    try:
+        if dev.is_kernel_driver_active(0):
+            dev.detach_kernel_driver(0)
+    except:
+        pass
+    
     cfg = dev.get_active_configuration()
     intf = cfg[(0, 0)]
-    ep_out = [ep for ep in intf if usb.util.endpoint_direction(ep.bEndpointAddress) == usb.util.ENDPOINT_OUT][0]
-    ep_in  = [ep for ep in intf if usb.util.endpoint_direction(ep.bEndpointAddress) == usb.util.ENDPOINT_IN][0]
-
-    io = UsbIO(ep_in, ep_out, intf, cfg, dev)
-    link = D4Link(io)
-    epson = EpsonD4(link)
-    epson.configure("L800")
-
-    # HTML-like remote command builder (same format as epson_escp2's remote_cmd)
-    def rem(cmd, args=b''):
-        cmd_bytes = cmd.encode()  # 2 bytes
-        length = len(args)
-        return cmd_bytes + struct.pack('<H', length) + args
-
-    import struct
-
-    if choice == "5":
-        # Nozzle Check via ESC/P2 Remote Mode
-        print(f"\n⚙️  Teste de Bicos...")
-        # Build proper sequence with ESC/P2
-        INIT = b'\x1b@'
-        REMOTE = b'\x1b(R\x08\x00\x00\x00REMOTE1'
-        ENTER_REMOTE = INIT + INIT + REMOTE
-        EXIT_REMOTE = b'\x1b\x00\x00\x00'
-
-        # Build the full sequence as bytes
-        # First send exit packet mode to get out of any previous D4 state
-        exit_packet = b'\x00\x00\x00\x1b\x01@EJL 1284.4\n@EJL     \n'
-        payload = exit_packet + ENTER_REMOTE + rem("NC", b'\x00\x00') + EXIT_REMOTE + INIT + rem("JE", b'\x00') + EXIT_REMOTE
-
-        print(f"   Payload: {len(payload)} bytes")
-        # Try sending via EPSON-DATA channel through D4
-        with link:
-            print("   D4 link OK")
-            # Send through data channel
-            dc = link.get_channel('EPSON-DATA', (0x40, 0x40))
-            if dc:
-                with dc:
-                    resp = dc(payload)
-                    print(f"   Resposta DATA: {resp[:80] if resp else 'empty'}")
-                print("✅ Teste de Bicos enviado via DATA channel!")
-            else:
-                print("⚠️  Sem DATA channel, tentando via CTRL...")
-                resp = epson.ctrl(payload)
-                print(f"   Resposta CTRL: {resp}")
-        return
-
-    # Head Cleaning via CTRL channel commands
-    print(f"\n⚙️  {label}...")
-
-    # Para CH (Clean Heads) o formato via CTRL não é Remote Mode padrão.
-    # O comando CH no Epson é um comando proprietário.
-    # Vamos tentar enviar o comando direto como bytes no canal CTRL.
-    ch_cmd = rem("CH", bytes([0x00, group]))
-    je_cmd = rem("JE", b'\x00')
-
+    
+    ep_out = None
+    for ep in intf:
+        if usb.util.endpoint_direction(ep.bEndpointAddress) == usb.util.ENDPOINT_OUT:
+            ep_out = ep
+            break
+    
+    if not ep_out:
+        print("❌ Endpoint OUT não encontrado!"); sys.exit(1)
+    
+    print(f"\n⚙️  {label}")
+    print(f"   {len(payload)} bytes → endpoint OUT {ep_out.bEndpointAddress:#04x}")
+    print(f"   Hex: {payload[:40].hex()}...")
+    
+    # Escrever direto no endpoint USB (sem D4)
     try:
-        resp = epson.ctrl(ch_cmd)
-        print(f"   CH resposta: {resp}")
-        epson.ctrl(je_cmd)
-        print(f"\n✅ {label} executado via CTRL!")
-        print("   🕐 Aguarde ~2-3 min.")
-    except Exception as ex:
-        print(f"   ❌ Via CTRL: {ex}")
-        print("   Tentando via data channel...")
+        written = ep_out.write(payload, timeout=10000)
+        print(f"   {written} bytes escritos ✅")
+        print(f"\n✅ Comando ESC/P2 enviado com sucesso!")
+        if choice == "5":
+            print("   Coloque papel — a L800 vai imprimir o padrão de teste.")
+        else:
+            print("   🕐 Aguarde 2-3 min — a L800 vai fazer o ciclo de limpeza.")
+    except usb.core.USBError as e:
+        print(f"\n❌ Erro USB: {e}")
+        # Tentativa alternativa: enviar via bulk
+        print("   Tentando via bulk write...")
         try:
-            INIT = b'\x1b@'
-            REMOTE = b'\x1b(R\x08\x00\x00\x00REMOTE1'
-            ENTER_REMOTE = INIT + INIT + REMOTE
-            EXIT_REMOTE = b'\x1b\x00\x00\x00'
-            payload = ENTER_REMOTE + ch_cmd + EXIT_REMOTE + ENTER_REMOTE + je_cmd + EXIT_REMOTE
-            with link:
-                dc = link.get_channel('EPSON-DATA', (0x40, 0x40))
-                if dc:
-                    with dc:
-                        dc(payload)
-                    print(f"✅ {label} enviado via DATA!")
-                    print("   🕐 Aguarde ~2-3 min.")
-        except Exception as ex2:
-            print(f"   ❌ Via DATA: {ex2}")
+            dev.write(ep_out.bEndpointAddress, payload, timeout=10000)
+            print("   ✅ OK via bulk write!")
+        except Exception as e2:
+            print(f"   ❌ Também falhou: {e2}")
 
 if __name__ == '__main__':
     main()
